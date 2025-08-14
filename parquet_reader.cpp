@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <cstring>
@@ -400,115 +401,101 @@ static vector<string> candidate_files(const string& root,
 
 // ======== RowGroup -> column vectors (decode once per RG) ========
 
+// Replace your existing FileStreamerTopCols with this version:
+
 struct FileStreamerTopCols
 {
-  unique_ptr<parquet::ParquetFileReader> reader;
-  shared_ptr<parquet::FileMetaData> md;
+  std::unique_ptr<parquet::ParquetFileReader> reader;
+  std::shared_ptr<parquet::FileMetaData> md;
   const parquet::SchemaDescriptor* schema = nullptr;
   int rg_idx = 0;
 
-  explicit FileStreamerTopCols(string path)
+  explicit FileStreamerTopCols(std::string path)
   {
-    cout << path << endl;
+    std::cout << path << std::endl;
+    // mmap can be faster; flip to true if your filesystem benefits
     reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
     md     = reader->metadata();
     schema = md->schema();
   }
 
+  // Decode a required int64 column for the whole RG into 'out' (size = rows)
+  static void read_required_i64_column(
+      parquet::RowGroupReader& rg, int col_idx, std::vector<int64_t>& out)
+  {
+    const int64_t rows = rg.metadata()->num_rows();
+    out.resize(rows);
+
+    std::shared_ptr<parquet::ColumnReader> col = rg.Column(col_idx);
+    auto* r = static_cast<parquet::Int64Reader*>(col.get());
+
+    int64_t done = 0;
+    while (done < rows) {
+      int64_t values_read = 0;
+      // required & flat → no def/rep streams
+      const int64_t levels = r->ReadBatch(rows - done, nullptr, nullptr, out.data() + done, &values_read);
+      if (levels == 0 && values_read == 0) break; // EOF safeguard
+      done += values_read;
+    }
+    if (done != rows) throw std::runtime_error("Short read in required column");
+  }
+
   bool next_rg(
       int64_t start_ns, int64_t end_ns, const TopSelect& sel,
-      vector<int64_t>& v_ts, vector<int64_t>& v_apx, vector<int64_t>& v_aq,
-      vector<int64_t>& v_bpx, vector<int64_t>& v_bq, vector<int64_t>& v_val)
+      std::vector<int64_t>& v_ts, std::vector<int64_t>& v_apx, std::vector<int64_t>& v_aq,
+      std::vector<int64_t>& v_bpx, std::vector<int64_t>& v_bq, std::vector<int64_t>& v_val)
   {
     while (true)
     {
-      if (rg_idx >= md->num_row_groups())
-      {
-        return false;
+      if (rg_idx >= md->num_row_groups()) return false;
+
+      std::shared_ptr<parquet::RowGroupReader> rg = reader->RowGroup(rg_idx++);
+      const int64_t rows = rg->metadata()->num_rows();
+
+      const int ts_i = find_col_idx(schema, "ts");
+      if (ts_i < 0) throw std::runtime_error("top: missing ts");
+
+      // 1) Decode ts column for the whole RG (fast path)
+      std::vector<int64_t> ts_all;
+      read_required_i64_column(*rg, ts_i, ts_all);
+
+      // 2) Build keep-index list for the time range
+      std::vector<uint32_t> keep;
+      keep.reserve(ts_all.size());
+      for (uint32_t i = 0; i < ts_all.size(); ++i) {
+        const int64_t t = ts_all[i];
+        if (t >= start_ns && t < end_ns) keep.push_back(i);
       }
+      if (keep.empty()) continue; // nothing in range → try next RG
 
-      shared_ptr<parquet::RowGroupReader> rg = reader->RowGroup(rg_idx++);
-      auto rmd = rg->metadata();
-      int64_t rows = rmd->num_rows();
+      // 3) Prepare outputs
+      v_ts.resize(keep.size());
+      if (sel.askPx)  v_apx.resize(keep.size()); else v_apx.clear();
+      if (sel.askQty) v_aq.resize(keep.size());  else v_aq.clear();
+      if (sel.bidPx)  v_bpx.resize(keep.size()); else v_bpx.clear();
+      if (sel.bidQty) v_bq.resize(keep.size());  else v_bq.clear();
+      if (sel.valu)   v_val.resize(keep.size()); else v_val.clear();
 
-      int ts_i  = find_col_idx(schema, "ts");
-      if (ts_i < 0)
-      {
-        throw runtime_error("top: missing ts");
-      }
+      // 4) Scatter ts into output
+      for (size_t j = 0; j < keep.size(); ++j) v_ts[j] = ts_all[keep[j]];
 
-      Int64Cursor ts (rg->Column(ts_i), schema->Column(ts_i));
+      // Helper: read a selected column (if requested) and scatter by keep-indexes
+      auto read_and_scatter = [&](const char* name, std::vector<int64_t>& out_vec) {
+        const int idx = find_col_idx(schema, name);
+        if (idx < 0) throw std::runtime_error(std::string("top: missing ") + name);
+        std::vector<int64_t> tmp;
+        read_required_i64_column(*rg, idx, tmp);
+        for (size_t j = 0; j < keep.size(); ++j) out_vec[j] = tmp[keep[j]];
+      };
 
-      optional<Int64Cursor> apx, aq, bpx, bq, val;
+      // 5) Decode only requested columns and scatter
+      if (sel.askPx)  read_and_scatter("askPx",  v_apx);
+      if (sel.askQty) read_and_scatter("askQty", v_aq);
+      if (sel.bidPx)  read_and_scatter("bidPx",  v_bpx);
+      if (sel.bidQty) read_and_scatter("bidQty", v_bq);
+      if (sel.valu)   read_and_scatter("valu",   v_val);
 
-      if (sel.askPx)
-      {
-        int apx_i = find_col_idx(schema, "askPx");
-        if (apx_i < 0) { throw runtime_error("top: missing askPx"); }
-        apx.emplace(rg->Column(apx_i), schema->Column(apx_i));
-      }
-      if (sel.askQty)
-      {
-        int aq_i = find_col_idx(schema, "askQty");
-        if (aq_i < 0) { throw runtime_error("top: missing askQty"); }
-        aq.emplace(rg->Column(aq_i), schema->Column(aq_i));
-      }
-      if (sel.bidPx)
-      {
-        int bpx_i = find_col_idx(schema, "bidPx");
-        if (bpx_i < 0) { throw runtime_error("top: missing bidPx"); }
-        bpx.emplace(rg->Column(bpx_i), schema->Column(bpx_i));
-      }
-      if (sel.bidQty)
-      {
-        int bq_i = find_col_idx(schema, "bidQty");
-        if (bq_i < 0) { throw runtime_error("top: missing bidQty"); }
-        bq.emplace(rg->Column(bq_i), schema->Column(bq_i));
-      }
-      if (sel.valu)
-      {
-        int val_i = find_col_idx(schema, "valu");
-        if (val_i < 0) { throw runtime_error("top: missing valu"); }
-        val.emplace(rg->Column(val_i), schema->Column(val_i));
-      }
-
-      v_ts.clear(); v_apx.clear(); v_aq.clear();
-      v_bpx.clear(); v_bq.clear(); v_val.clear();
-
-      v_ts.reserve(rows);
-      if (sel.askPx)  { v_apx.reserve(rows); }
-      if (sel.askQty) { v_aq.reserve(rows); }
-      if (sel.bidPx)  { v_bpx.reserve(rows); }
-      if (sel.bidQty) { v_bq.reserve(rows); }
-      if (sel.valu)   { v_val.reserve(rows); }
-
-      for (int64_t r = 0; r < rows; ++r)
-      {
-        Entry e_ts = ts.take();
-
-        Entry e_apx{}, e_aq{}, e_bpx{}, e_bq{}, e_val{};
-
-        if (sel.askPx)  { e_apx  = apx->take(); }
-        if (sel.askQty) { e_aq   = aq->take(); }
-        if (sel.bidPx)  { e_bpx  = bpx->take(); }
-        if (sel.bidQty) { e_bq   = bq->take(); }
-        if (sel.valu)   { e_val  = val->take(); }
-
-        if (e_ts.value >= start_ns && e_ts.value < end_ns)
-        {
-          v_ts.push_back(e_ts.value);
-          if (sel.askPx)  { v_apx.push_back(e_apx.value); }
-          if (sel.askQty) { v_aq.push_back(e_aq.value); }
-          if (sel.bidPx)  { v_bpx.push_back(e_bpx.value); }
-          if (sel.bidQty) { v_bq.push_back(e_bq.value); }
-          if (sel.valu)   { v_val.push_back(e_val.value); }
-        }
-      }
-
-      if (!v_ts.empty())
-      {
-        return true;
-      }
+      return true;
     }
   }
 };
@@ -1110,3 +1097,4 @@ int main(int argc, char** argv)
 
   return 0;
 }
+

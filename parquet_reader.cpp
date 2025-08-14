@@ -81,7 +81,8 @@ struct DeltaSelect
 
 struct Entry
 {
-  int16_t def = 0, rep = 0;
+  int16_t def = 0;
+  int16_t rep = 0;
   bool has_value = false;
   int64_t value = 0;
   bool valid = false;
@@ -91,14 +92,16 @@ struct Int64Cursor
 {
   shared_ptr<parquet::ColumnReader> holder;
   parquet::Int64Reader* r = nullptr;
-  int16_t max_def = 0, max_rep = 0;
+  int16_t max_def = 0;
+  int16_t max_rep = 0;
   bool eof = false;
 
   bool has_pending = false;
   Entry pending;
 
   static constexpr int64_t BATCH = 65536;
-  vector<int16_t> defbuf, repbuf;
+  vector<int16_t> defbuf;
+  vector<int16_t> repbuf;
   vector<int64_t> valbuf;
   int64_t levels_in_buf = 0;
   int64_t level_idx = 0;
@@ -211,7 +214,7 @@ struct Int64Cursor
   {
     if (!ensure_pending())
     {
-      return Entry{}; // invalid
+      return Entry{};
     }
 
     has_pending = false;
@@ -321,6 +324,7 @@ static uint32_t append_list_pairs_for_row_typed(
 
     const Entry* npx = px.peek();
     const Entry* nqy = qty.peek();
+
     if (!npx || !nqy)
     {
       break;
@@ -331,7 +335,7 @@ static uint32_t append_list_pairs_for_row_typed(
     }
     if (npx->rep != nqy->rep)
     {
-      break; // defensive
+      break;
     }
   }
 
@@ -390,85 +394,96 @@ static vector<string> candidate_files(const string& root,
 
     if (fs::exists(p.str()))
     {
-      // Already chronological because we step day by day
       paths.push_back(p.str());
     }
   }
 
-  // No sort/unique: avoid lexicographic "1,10,11,2..."
   return paths;
 }
 
 // ======== RowGroup -> column vectors (decode once per RG) ========
 
-// Replace your existing FileStreamerTopCols with this version:
-
 struct FileStreamerTopCols
 {
-  std::unique_ptr<parquet::ParquetFileReader> reader;
-  std::shared_ptr<parquet::FileMetaData> md;
+  unique_ptr<parquet::ParquetFileReader> reader;
+  shared_ptr<parquet::FileMetaData> md;
   const parquet::SchemaDescriptor* schema = nullptr;
   int rg_idx = 0;
 
-  explicit FileStreamerTopCols(std::string path)
+  explicit FileStreamerTopCols(string path)
   {
-    std::cout << path << std::endl;
-    // mmap can be faster; flip to true if your filesystem benefits
+    cout << path << endl;
     reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
     md     = reader->metadata();
     schema = md->schema();
   }
 
-  // Decode a required int64 column for the whole RG into 'out' (size = rows)
   static void read_required_i64_column(
-      parquet::RowGroupReader& rg, int col_idx, std::vector<int64_t>& out)
+      parquet::RowGroupReader& rg, int col_idx, vector<int64_t>& out)
   {
     const int64_t rows = rg.metadata()->num_rows();
     out.resize(rows);
 
-    std::shared_ptr<parquet::ColumnReader> col = rg.Column(col_idx);
+    shared_ptr<parquet::ColumnReader> col = rg.Column(col_idx);
     auto* r = static_cast<parquet::Int64Reader*>(col.get());
 
     int64_t done = 0;
-    while (done < rows) {
+    while (done < rows)
+    {
       int64_t values_read = 0;
-      // required & flat → no def/rep streams
-      const int64_t levels = r->ReadBatch(rows - done, nullptr, nullptr, out.data() + done, &values_read);
-      if (levels == 0 && values_read == 0) break; // EOF safeguard
+      int64_t levels = r->ReadBatch(rows - done, nullptr, nullptr, out.data() + done, &values_read);
+      if (levels == 0 && values_read == 0)
+      {
+        break;
+      }
       done += values_read;
     }
-    if (done != rows) throw std::runtime_error("Short read in required column");
+
+    if (done != rows)
+    {
+      throw runtime_error("Short read in required column");
+    }
   }
 
   bool next_rg(
       int64_t start_ns, int64_t end_ns, const TopSelect& sel,
-      std::vector<int64_t>& v_ts, std::vector<int64_t>& v_apx, std::vector<int64_t>& v_aq,
-      std::vector<int64_t>& v_bpx, std::vector<int64_t>& v_bq, std::vector<int64_t>& v_val)
+      vector<int64_t>& v_ts, vector<int64_t>& v_apx, vector<int64_t>& v_aq,
+      vector<int64_t>& v_bpx, vector<int64_t>& v_bq, vector<int64_t>& v_val)
   {
     while (true)
     {
-      if (rg_idx >= md->num_row_groups()) return false;
+      if (rg_idx >= md->num_row_groups())
+      {
+        return false;
+      }
 
-      std::shared_ptr<parquet::RowGroupReader> rg = reader->RowGroup(rg_idx++);
+      shared_ptr<parquet::RowGroupReader> rg = reader->RowGroup(rg_idx++);
       const int64_t rows = rg->metadata()->num_rows();
 
       const int ts_i = find_col_idx(schema, "ts");
-      if (ts_i < 0) throw std::runtime_error("top: missing ts");
+      if (ts_i < 0)
+      {
+        throw runtime_error("top: missing ts");
+      }
 
-      // 1) Decode ts column for the whole RG (fast path)
-      std::vector<int64_t> ts_all;
+      vector<int64_t> ts_all;
       read_required_i64_column(*rg, ts_i, ts_all);
 
-      // 2) Build keep-index list for the time range
-      std::vector<uint32_t> keep;
+      vector<uint32_t> keep;
       keep.reserve(ts_all.size());
-      for (uint32_t i = 0; i < ts_all.size(); ++i) {
-        const int64_t t = ts_all[i];
-        if (t >= start_ns && t < end_ns) keep.push_back(i);
+      for (uint32_t i = 0; i < ts_all.size(); ++i)
+      {
+        int64_t t = ts_all[i];
+        if (t >= start_ns && t < end_ns)
+        {
+          keep.push_back(i);
+        }
       }
-      if (keep.empty()) continue; // nothing in range → try next RG
+      if (keep.empty())
+      {
+        continue;
+      }
 
-      // 3) Prepare outputs
       v_ts.resize(keep.size());
       if (sel.askPx)  v_apx.resize(keep.size()); else v_apx.clear();
       if (sel.askQty) v_aq.resize(keep.size());  else v_aq.clear();
@@ -476,24 +491,46 @@ struct FileStreamerTopCols
       if (sel.bidQty) v_bq.resize(keep.size());  else v_bq.clear();
       if (sel.valu)   v_val.resize(keep.size()); else v_val.clear();
 
-      // 4) Scatter ts into output
-      for (size_t j = 0; j < keep.size(); ++j) v_ts[j] = ts_all[keep[j]];
+      for (size_t j = 0; j < keep.size(); ++j)
+      {
+        v_ts[j] = ts_all[keep[j]];
+      }
 
-      // Helper: read a selected column (if requested) and scatter by keep-indexes
-      auto read_and_scatter = [&](const char* name, std::vector<int64_t>& out_vec) {
+      auto read_and_scatter = [&](const char* name, vector<int64_t>& out_vec)
+      {
         const int idx = find_col_idx(schema, name);
-        if (idx < 0) throw std::runtime_error(std::string("top: missing ") + name);
-        std::vector<int64_t> tmp;
+        if (idx < 0)
+        {
+          throw runtime_error(string("top: missing ") + name);
+        }
+        vector<int64_t> tmp;
         read_required_i64_column(*rg, idx, tmp);
-        for (size_t j = 0; j < keep.size(); ++j) out_vec[j] = tmp[keep[j]];
+        for (size_t j = 0; j < keep.size(); ++j)
+        {
+          out_vec[j] = tmp[keep[j]];
+        }
       };
 
-      // 5) Decode only requested columns and scatter
-      if (sel.askPx)  read_and_scatter("askPx",  v_apx);
-      if (sel.askQty) read_and_scatter("askQty", v_aq);
-      if (sel.bidPx)  read_and_scatter("bidPx",  v_bpx);
-      if (sel.bidQty) read_and_scatter("bidQty", v_bq);
-      if (sel.valu)   read_and_scatter("valu",   v_val);
+      if (sel.askPx)
+      {
+        read_and_scatter("askPx", v_apx);
+      }
+      if (sel.askQty)
+      {
+        read_and_scatter("askQty", v_aq);
+      }
+      if (sel.bidPx)
+      {
+        read_and_scatter("bidPx", v_bpx);
+      }
+      if (sel.bidQty)
+      {
+        read_and_scatter("bidQty", v_bq);
+      }
+      if (sel.valu)
+      {
+        read_and_scatter("valu", v_val);
+      }
 
       return true;
     }
@@ -539,44 +576,64 @@ struct FileStreamerDeltaCols
       }
       Int64Cursor ts(rg->Column(ts_i), schema->Column(ts_i));
 
-      optional<Int64Cursor> fid, lid, evt;
+      optional<Int64Cursor> fid;
+      optional<Int64Cursor> lid;
+      optional<Int64Cursor> evt;
 
       if (sel.firstId)
       {
         int fid_i = find_col_idx(schema, "firstId");
-        if (fid_i < 0) { throw runtime_error("delta: missing firstId"); }
+        if (fid_i < 0)
+        {
+          throw runtime_error("delta: missing firstId");
+        }
         fid.emplace(rg->Column(fid_i), schema->Column(fid_i));
       }
       if (sel.lastId)
       {
         int lid_i = find_col_idx(schema, "lastId");
-        if (lid_i < 0) { throw runtime_error("delta: missing lastId"); }
+        if (lid_i < 0)
+        {
+          throw runtime_error("delta: missing lastId");
+        }
         lid.emplace(rg->Column(lid_i), schema->Column(lid_i));
       }
       if (sel.eventTime)
       {
         int evt_i = find_col_idx(schema, "eventTime");
-        if (evt_i < 0) { throw runtime_error("delta: missing eventTime"); }
+        if (evt_i < 0)
+        {
+          throw runtime_error("delta: missing eventTime");
+        }
         evt.emplace(rg->Column(evt_i), schema->Column(evt_i));
       }
 
       bool need_asks = (sel.ask_px || sel.ask_qty);
       bool need_bids = (sel.bid_px || sel.bid_qty);
 
-      optional<Int64Cursor> apx, aqty, bpx, bqty;
+      optional<Int64Cursor> apx;
+      optional<Int64Cursor> aqty;
+      optional<Int64Cursor> bpx;
+      optional<Int64Cursor> bqty;
 
       if (need_asks)
       {
         if (sel.ask_px)
         {
           int apx_i = find_col_idx(schema, "ask.list.element.px");
-          if (apx_i < 0) { throw runtime_error("delta: missing ask px"); }
+          if (apx_i < 0)
+          {
+            throw runtime_error("delta: missing ask px");
+          }
           apx.emplace(rg->Column(apx_i), schema->Column(apx_i));
         }
         if (sel.ask_qty)
         {
           int aqty_i = find_col_idx(schema, "ask.list.element.qty");
-          if (aqty_i < 0) { throw runtime_error("delta: missing ask qty"); }
+          if (aqty_i < 0)
+          {
+            throw runtime_error("delta: missing ask qty");
+          }
           aqty.emplace(rg->Column(aqty_i), schema->Column(aqty_i));
         }
       }
@@ -586,40 +643,82 @@ struct FileStreamerDeltaCols
         if (sel.bid_px)
         {
           int bpx_i = find_col_idx(schema, "bid.list.element.px");
-          if (bpx_i < 0) { throw runtime_error("delta: missing bid px"); }
+          if (bpx_i < 0)
+          {
+            throw runtime_error("delta: missing bid px");
+          }
           bpx.emplace(rg->Column(bpx_i), schema->Column(bpx_i));
         }
         if (sel.bid_qty)
         {
           int bqty_i = find_col_idx(schema, "bid.list.element.qty");
-          if (bqty_i < 0) { throw runtime_error("delta: missing bid qty"); }
+          if (bqty_i < 0)
+          {
+            throw runtime_error("delta: missing bid qty");
+          }
           bqty.emplace(rg->Column(bqty_i), schema->Column(bqty_i));
         }
       }
 
-      v_ts.clear(); v_fid.clear(); v_lid.clear(); v_evt.clear();
-      ask_off.clear(); ask_px.clear(); ask_qty.clear();
-      bid_off.clear(); bid_px.clear(); bid_qty.clear();
+      v_ts.clear();
+      v_fid.clear();
+      v_lid.clear();
+      v_evt.clear();
+      ask_off.clear();
+      ask_px.clear();
+      ask_qty.clear();
+      bid_off.clear();
+      bid_px.clear();
+      bid_qty.clear();
 
       v_ts.reserve(rows);
-      if (sel.firstId)   { v_fid.reserve(rows); }
-      if (sel.lastId)    { v_lid.reserve(rows); }
-      if (sel.eventTime) { v_evt.reserve(rows); }
-      if (need_asks)     { ask_off.reserve(rows + 1); ask_off.push_back(0); }
-      if (need_bids)     { bid_off.reserve(rows + 1); bid_off.push_back(0); }
+      if (sel.firstId)
+      {
+        v_fid.reserve(rows);
+      }
+      if (sel.lastId)
+      {
+        v_lid.reserve(rows);
+      }
+      if (sel.eventTime)
+      {
+        v_evt.reserve(rows);
+      }
+      if (need_asks)
+      {
+        ask_off.reserve(rows + 1);
+        ask_off.push_back(0);
+      }
+      if (need_bids)
+      {
+        bid_off.reserve(rows + 1);
+        bid_off.push_back(0);
+      }
 
       for (int64_t r = 0; r < rows; ++r)
       {
         Entry e_ts = ts.take();
 
-        Entry e_fid{}, e_lid{}, e_evt{};
-        if (sel.firstId)   { e_fid = fid->take(); }
-        if (sel.lastId)    { e_lid = lid->take(); }
-        if (sel.eventTime) { e_evt = evt->take(); }
+        Entry e_fid{};
+        Entry e_lid{};
+        Entry e_evt{};
+        if (sel.firstId)
+        {
+          e_fid = fid->take();
+        }
+        if (sel.lastId)
+        {
+          e_lid = lid->take();
+        }
+        if (sel.eventTime)
+        {
+          e_evt = evt->take();
+        }
 
         bool in_range = (e_ts.value >= start_ns && e_ts.value < end_ns);
 
-        uint32_t asks_added = 0, bids_added = 0;
+        uint32_t asks_added = 0;
+        uint32_t bids_added = 0;
 
         if (need_asks)
         {
@@ -670,12 +769,27 @@ struct FileStreamerDeltaCols
         if (in_range)
         {
           v_ts.push_back(e_ts.value);
-          if (sel.firstId)   { v_fid.push_back(e_fid.value); }
-          if (sel.lastId)    { v_lid.push_back(e_lid.value); }
-          if (sel.eventTime) { v_evt.push_back(e_evt.value); }
+          if (sel.firstId)
+          {
+            v_fid.push_back(e_fid.value);
+          }
+          if (sel.lastId)
+          {
+            v_lid.push_back(e_lid.value);
+          }
+          if (sel.eventTime)
+          {
+            v_evt.push_back(e_evt.value);
+          }
 
-          if (need_asks) { ask_off.push_back(ask_off.back() + asks_added); }
-          if (need_bids) { bid_off.push_back(bid_off.back() + bids_added); }
+          if (need_asks)
+          {
+            ask_off.push_back(ask_off.back() + asks_added);
+          }
+          if (need_bids)
+          {
+            bid_off.push_back(bid_off.back() + bids_added);
+          }
         }
       }
 
@@ -701,7 +815,10 @@ public:
   {
     TopBatchReader(vector<string> files, int64_t s, int64_t e, TopSelect sel)
     :
-      files_(move(files)), start_ns_(s), end_ns_(e), sel_(sel)
+      files_(move(files)),
+      start_ns_(s),
+      end_ns_(e),
+      sel_(sel)
     {}
 
     bool next(TopColsView& out)
@@ -766,17 +883,26 @@ public:
     vector<string> files_;
     size_t file_idx_ = 0;
     unique_ptr<FileStreamerTopCols> fs_;
-    int64_t start_ns_, end_ns_;
+    int64_t start_ns_;
+    int64_t end_ns_;
     TopSelect sel_;
 
-    vector<int64_t> ts_, apx_, aq_, bpx_, bq_, val_;
+    vector<int64_t> ts_;
+    vector<int64_t> apx_;
+    vector<int64_t> aq_;
+    vector<int64_t> bpx_;
+    vector<int64_t> bq_;
+    vector<int64_t> val_;
   };
 
   struct DeltaBatchReader
   {
     DeltaBatchReader(vector<string> files, int64_t s, int64_t e, DeltaSelect sel)
     :
-      files_(move(files)), start_ns_(s), end_ns_(e), sel_(sel)
+      files_(move(files)),
+      start_ns_(s),
+      end_ns_(e),
+      sel_(sel)
     {}
 
     bool next(DeltaColsView& out)
@@ -855,12 +981,20 @@ public:
     vector<string> files_;
     size_t file_idx_ = 0;
     unique_ptr<FileStreamerDeltaCols> fs_;
-    int64_t start_ns_, end_ns_;
+    int64_t start_ns_;
+    int64_t end_ns_;
     DeltaSelect sel_;
 
-    vector<int64_t> ts_, fid_, lid_, evt_;
-    vector<uint32_t> ask_off_, bid_off_;
-    vector<int64_t>  ask_px_,  ask_qty_, bid_px_, bid_qty_;
+    vector<int64_t> ts_;
+    vector<int64_t> fid_;
+    vector<int64_t> lid_;
+    vector<int64_t> evt_;
+    vector<uint32_t> ask_off_;
+    vector<uint32_t> bid_off_;
+    vector<int64_t>  ask_px_;
+    vector<int64_t>  ask_qty_;
+    vector<int64_t>  bid_px_;
+    vector<int64_t>  bid_qty_;
   };
 
   unique_ptr<TopBatchReader> get_top_cols(
@@ -931,7 +1065,12 @@ static vector<string> split_csv(const string& s)
 static TopSelect make_top_select_from_csv(const string& csv)
 {
   TopSelect sel{};
-  sel.ts = sel.askPx = sel.askQty = sel.bidPx = sel.bidQty = sel.valu = false;
+  sel.ts = false;
+  sel.askPx = false;
+  sel.askQty = false;
+  sel.bidPx = false;
+  sel.bidQty = false;
+  sel.valu = false;
 
   for (string t : split_csv(csv))
   {
@@ -949,8 +1088,14 @@ static TopSelect make_top_select_from_csv(const string& csv)
 static DeltaSelect make_delta_select_from_csv(const string& csv)
 {
   DeltaSelect sel{};
-  sel.ts = sel.firstId = sel.lastId = sel.eventTime = false;
-  sel.ask_px = sel.ask_qty = sel.bid_px = sel.bid_qty = false;
+  sel.ts = false;
+  sel.firstId = false;
+  sel.lastId = false;
+  sel.eventTime = false;
+  sel.ask_px = false;
+  sel.ask_qty = false;
+  sel.bid_px = false;
+  sel.bid_qty = false;
 
   for (string t : split_csv(csv))
   {
@@ -959,7 +1104,6 @@ static DeltaSelect make_delta_select_from_csv(const string& csv)
     else if (k == "firstid" || k == "fid") { sel.firstId = true; }
     else if (k == "lastid"  || k == "lid") { sel.lastId = true; }
     else if (k == "eventtime" || k == "evt" || k == "event") { sel.eventTime = true; }
-
     else if (k == "askpx" || k == "px" || k == "ask" || k == "askprice") { sel.ask_px = true; }
     else if (k == "askqty" || k == "qty" || k == "asksize") { sel.ask_qty = true; }
     else if (k == "bidpx" || k == "bid" || k == "bidprice") { sel.bid_px = true; }
@@ -994,7 +1138,7 @@ int main(int argc, char** argv)
     TopSelect sel{};
     if (argc >= 7)
     {
-      sel = make_top_select_from_csv(argv[6]); // else defaults: all true
+      sel = make_top_select_from_csv(argv[6]);
     }
 
     auto rdr = db.get_top_cols(start_ns, end_ns, symb, sel);
@@ -1012,12 +1156,44 @@ int main(int argc, char** argv)
         }
 
         bool first = true;
-        if (v.ts)     { if (!first) { cout << ';'; } cout << v.ts[i];     first = false; }
-        if (v.askPx)  { if (!first) { cout << ';'; } cout << v.askPx[i];  first = false; }
-        if (v.askQty) { if (!first) { cout << ';'; } cout << v.askQty[i]; first = false; }
-        if (v.bidPx)  { if (!first) { cout << ';'; } cout << v.bidPx[i];  first = false; }
-        if (v.bidQty) { if (!first) { cout << ';'; } cout << v.bidQty[i]; first = false; }
-        if (v.valu)   { if (!first) { cout << ';'; } cout << v.valu[i];   first = false; }
+
+        if (v.ts)
+        {
+          if (!first) { cout << ';'; }
+          cout << v.ts[i];
+          first = false;
+        }
+        if (v.askPx)
+        {
+          if (!first) { cout << ';'; }
+          cout << v.askPx[i];
+          first = false;
+        }
+        if (v.askQty)
+        {
+          if (!first) { cout << ';'; }
+          cout << v.askQty[i];
+          first = false;
+        }
+        if (v.bidPx)
+        {
+          if (!first) { cout << ';'; }
+          cout << v.bidPx[i];
+          first = false;
+        }
+        if (v.bidQty)
+        {
+          if (!first) { cout << ';'; }
+          cout << v.bidQty[i];
+          first = false;
+        }
+        if (v.valu)
+        {
+          if (!first) { cout << ';'; }
+          cout << v.valu[i];
+          first = false;
+        }
+
         cout << '\n';
       }
     }
@@ -1027,7 +1203,7 @@ int main(int argc, char** argv)
     DeltaSelect sel{};
     if (argc >= 7)
     {
-      sel = make_delta_select_from_csv(argv[6]); // else defaults: all true
+      sel = make_delta_select_from_csv(argv[6]);
     }
 
     auto rdr = db.get_delta_cols(start_ns, end_ns, symb, sel);
@@ -1045,6 +1221,7 @@ int main(int argc, char** argv)
         }
 
         bool first = true;
+
         auto put = [&](int64_t x)
         {
           if (!first) { cout << ';'; }
@@ -1058,30 +1235,64 @@ int main(int argc, char** argv)
         if (v.eventTime) { put(v.eventTime[i]); } else { put(0); }
 
         cout << ';';
+
         if (v.ask_off && (v.ask_px || v.ask_qty))
         {
-          uint32_t a0 = v.ask_off[i], a1 = v.ask_off[i + 1];
+          uint32_t a0 = v.ask_off[i];
+          uint32_t a1 = v.ask_off[i + 1];
           for (uint32_t k = a0; k < a1; ++k)
           {
-            if (k > a0) { cout << ','; }
-            if (v.ask_px)  { cout << v.ask_px[k]; }
-            if (v.ask_px && v.ask_qty) { cout << '('; }
-            if (v.ask_qty) { cout << v.ask_qty[k]; }
-            if (v.ask_px && v.ask_qty) { cout << ')'; }
+            if (k > a0)
+            {
+              cout << ',';
+            }
+            if (v.ask_px)
+            {
+              cout << v.ask_px[k];
+            }
+            if (v.ask_px && v.ask_qty)
+            {
+              cout << '(';
+            }
+            if (v.ask_qty)
+            {
+              cout << v.ask_qty[k];
+            }
+            if (v.ask_px && v.ask_qty)
+            {
+              cout << ')';
+            }
           }
         }
 
         cout << ';';
+
         if (v.bid_off && (v.bid_px || v.bid_qty))
         {
-          uint32_t b0 = v.bid_off[i], b1 = v.bid_off[i + 1];
+          uint32_t b0 = v.bid_off[i];
+          uint32_t b1 = v.bid_off[i + 1];
           for (uint32_t k = b0; k < b1; ++k)
           {
-            if (k > b0) { cout << ','; }
-            if (v.bid_px)  { cout << v.bid_px[k]; }
-            if (v.bid_px && v.bid_qty) { cout << '('; }
-            if (v.bid_qty) { cout << v.bid_qty[k]; }
-            if (v.bid_px && v.bid_qty) { cout << ')'; }
+            if (k > b0)
+            {
+              cout << ',';
+            }
+            if (v.bid_px)
+            {
+              cout << v.bid_px[k];
+            }
+            if (v.bid_px && v.bid_qty)
+            {
+              cout << '(';
+            }
+            if (v.bid_qty)
+            {
+              cout << v.bid_qty[k];
+            }
+            if (v.bid_px && v.bid_qty)
+            {
+              cout << ')';
+            }
           }
         }
 

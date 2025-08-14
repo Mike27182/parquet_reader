@@ -424,6 +424,18 @@ static vector<string> candidate_files(const string& root,
     {
       paths.push_back(p.str());
     }
+    else
+    {
+      ostringstream p;
+      p << root << '/' << symb
+        << '/' << ymd.year
+        << '/' << ymd.month
+        << "/bn_" << type << '_' << symb << '_' << ymd.year << '_' << ymd.month << '_' << ymd.day << ".parquet";
+      if (fs::exists(p.str()))
+      {
+        paths.push_back(p.str());
+      }
+    }
   }
 
   return paths;

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
@@ -52,11 +53,25 @@ struct DeltaColsView
   const int64_t*  bid_qty = nullptr;
 };
 
+struct TradeColsView
+{
+  const int64_t* ts            = nullptr;
+  const int64_t* px            = nullptr;
+  const int64_t* qty           = nullptr;
+  const int64_t* tradeId       = nullptr;
+  const int64_t* buyerOrderId  = nullptr;
+  const int64_t* sellerOrderId = nullptr;
+  const int64_t* tradeTime     = nullptr;
+  const uint8_t* isMarket      = nullptr;  // 0/1
+  const int64_t* eventTime     = nullptr;
+  size_t n = 0;
+};
+
 // ======== Column selection ========
 
 struct TopSelect
 {
-  bool ts     = true;  // returned in view (ts is always read for filtering)
+  bool ts     = true;
   bool askPx  = true;
   bool askQty = true;
   bool bidPx  = true;
@@ -66,7 +81,7 @@ struct TopSelect
 
 struct DeltaSelect
 {
-  bool ts        = true;  // returned in view (ts is always read for filtering)
+  bool ts        = true;
   bool firstId   = true;
   bool lastId    = true;
   bool eventTime = true;
@@ -77,7 +92,20 @@ struct DeltaSelect
   bool bid_qty = true;
 };
 
-// ======== Low-level batched cursor ========
+struct TradeSelect
+{
+  bool ts            = true;
+  bool px            = true;
+  bool qty           = true;
+  bool tradeId       = true;
+  bool buyerOrderId  = true;
+  bool sellerOrderId = true;
+  bool tradeTime     = true;
+  bool isMarket      = true;
+  bool eventTime     = true;
+};
+
+// ======== Low-level batched cursor (used by nested delta path) ========
 
 struct Entry
 {
@@ -342,7 +370,7 @@ static uint32_t append_list_pairs_for_row_typed(
   return count;
 }
 
-// ======== Date helpers & file mapping (chronological order, no lexicographic sort) ========
+// ======== Date helpers & file mapping (chronological order) ========
 
 struct YMD
 {
@@ -530,6 +558,202 @@ struct FileStreamerTopCols
       if (sel.valu)
       {
         read_and_scatter("valu", v_val);
+      }
+
+      return true;
+    }
+  }
+};
+
+struct FileStreamerTradeCols
+{
+  unique_ptr<parquet::ParquetFileReader> reader;
+  shared_ptr<parquet::FileMetaData> md;
+  const parquet::SchemaDescriptor* schema = nullptr;
+  int rg_idx = 0;
+
+  explicit FileStreamerTradeCols(string path)
+  {
+    cout << path << endl;
+    reader = parquet::ParquetFileReader::OpenFile(path, /*memory_map=*/false);
+    md     = reader->metadata();
+    schema = md->schema();
+  }
+
+  static void read_required_i64_column(
+      parquet::RowGroupReader& rg, int col_idx, vector<int64_t>& out)
+  {
+    const int64_t rows = rg.metadata()->num_rows();
+    out.resize(rows);
+
+    shared_ptr<parquet::ColumnReader> col = rg.Column(col_idx);
+    auto* r = static_cast<parquet::Int64Reader*>(col.get());
+
+    int64_t done = 0;
+    while (done < rows)
+    {
+      int64_t values_read = 0;
+      int64_t levels = r->ReadBatch(rows - done, nullptr, nullptr, out.data() + done, &values_read);
+      if (levels == 0 && values_read == 0)
+      {
+        break;
+      }
+      done += values_read;
+    }
+
+    if (done != rows)
+    {
+      throw runtime_error("Short read in required column");
+    }
+  }
+
+  static void read_required_bool_column(
+      parquet::RowGroupReader& rg, int col_idx, vector<uint8_t>& out)
+  {
+    static_assert(sizeof(bool) == 1, "bool must be 1 byte");
+    const int64_t rows = rg.metadata()->num_rows();
+    out.resize(rows);
+
+    shared_ptr<parquet::ColumnReader> col = rg.Column(col_idx);
+    auto* r = static_cast<parquet::BoolReader*>(col.get());
+
+    int64_t done = 0;
+    while (done < rows)
+    {
+      int64_t values_read = 0;
+      // Write directly into the byte buffer reinterpreted as bool*
+      int64_t levels = r->ReadBatch(rows - done, nullptr, nullptr,
+                                    reinterpret_cast<bool*>(out.data()) + done,
+                                    &values_read);
+      if (levels == 0 && values_read == 0)
+      {
+        break;
+      }
+      done += values_read;
+    }
+
+    if (done != rows)
+    {
+      throw runtime_error("Short read in required bool column");
+    }
+  }
+
+  bool next_rg(
+      int64_t start_ns, int64_t end_ns, const TradeSelect& sel,
+      vector<int64_t>& v_ts, vector<int64_t>& v_px, vector<int64_t>& v_qty,
+      vector<int64_t>& v_tid, vector<int64_t>& v_boid, vector<int64_t>& v_soid,
+      vector<int64_t>& v_ttime, vector<uint8_t>& v_isMkt, vector<int64_t>& v_evt)
+  {
+    while (true)
+    {
+      if (rg_idx >= md->num_row_groups())
+      {
+        return false;
+      }
+
+      shared_ptr<parquet::RowGroupReader> rg = reader->RowGroup(rg_idx++);
+      const int64_t rows = rg->metadata()->num_rows();
+
+      const int ts_i = find_col_idx(schema, "ts");
+      if (ts_i < 0)
+      {
+        throw runtime_error("trade: missing ts");
+      }
+
+      vector<int64_t> ts_all;
+      read_required_i64_column(*rg, ts_i, ts_all);
+
+      vector<uint32_t> keep;
+      keep.reserve(ts_all.size());
+      for (uint32_t i = 0; i < ts_all.size(); ++i)
+      {
+        int64_t t = ts_all[i];
+        if (t >= start_ns && t < end_ns)
+        {
+          keep.push_back(i);
+        }
+      }
+      if (keep.empty())
+      {
+        continue;
+      }
+
+      v_ts.resize(keep.size());
+      if (sel.px)            v_px.resize(keep.size());     else v_px.clear();
+      if (sel.qty)           v_qty.resize(keep.size());    else v_qty.clear();
+      if (sel.tradeId)       v_tid.resize(keep.size());    else v_tid.clear();
+      if (sel.buyerOrderId)  v_boid.resize(keep.size());   else v_boid.clear();
+      if (sel.sellerOrderId) v_soid.resize(keep.size());   else v_soid.clear();
+      if (sel.tradeTime)     v_ttime.resize(keep.size());  else v_ttime.clear();
+      if (sel.isMarket)      v_isMkt.resize(keep.size());  else v_isMkt.clear();
+      if (sel.eventTime)     v_evt.resize(keep.size());    else v_evt.clear();
+
+      for (size_t j = 0; j < keep.size(); ++j)
+      {
+        v_ts[j] = ts_all[keep[j]];
+      }
+
+      auto read_and_scatter_i64 = [&](const char* name, vector<int64_t>& out_vec)
+      {
+        const int idx = find_col_idx(schema, name);
+        if (idx < 0)
+        {
+          throw runtime_error(string("trade: missing ") + name);
+        }
+        vector<int64_t> tmp;
+        read_required_i64_column(*rg, idx, tmp);
+        for (size_t j = 0; j < keep.size(); ++j)
+        {
+          out_vec[j] = tmp[keep[j]];
+        }
+      };
+
+      auto read_and_scatter_bool = [&](const char* name, vector<uint8_t>& out_vec)
+      {
+        const int idx = find_col_idx(schema, name);
+        if (idx < 0)
+        {
+          throw runtime_error(string("trade: missing ") + name);
+        }
+        vector<uint8_t> tmp;
+        read_required_bool_column(*rg, idx, tmp);
+        for (size_t j = 0; j < keep.size(); ++j)
+        {
+          out_vec[j] = tmp[keep[j]];
+        }
+      };
+
+      if (sel.px)
+      {
+        read_and_scatter_i64("px", v_px);
+      }
+      if (sel.qty)
+      {
+        read_and_scatter_i64("qty", v_qty);
+      }
+      if (sel.tradeId)
+      {
+        read_and_scatter_i64("tradeId", v_tid);
+      }
+      if (sel.buyerOrderId)
+      {
+        read_and_scatter_i64("buyerOrderId", v_boid);
+      }
+      if (sel.sellerOrderId)
+      {
+        read_and_scatter_i64("sellerOrderId", v_soid);
+      }
+      if (sel.tradeTime)
+      {
+        read_and_scatter_i64("tradeTime", v_ttime);
+      }
+      if (sel.isMarket)
+      {
+        read_and_scatter_bool("isMarket", v_isMkt);
+      }
+      if (sel.eventTime)
+      {
+        read_and_scatter_i64("eventTime", v_evt);
       }
 
       return true;
@@ -814,7 +1038,7 @@ public:
   struct TopBatchReader
   {
     TopBatchReader(vector<string> files, int64_t s, int64_t e, TopSelect sel)
-    :
+  :
       files_(move(files)),
       start_ns_(s),
       end_ns_(e),
@@ -895,10 +1119,102 @@ public:
     vector<int64_t> val_;
   };
 
+  struct TradeBatchReader
+  {
+    TradeBatchReader(vector<string> files, int64_t s, int64_t e, TradeSelect sel)
+  :
+      files_(move(files)),
+      start_ns_(s),
+      end_ns_(e),
+      sel_(sel)
+    {}
+
+    bool next(TradeColsView& out)
+    {
+      while (true)
+      {
+        if (!fs_)
+        {
+          if (file_idx_ >= files_.size())
+          {
+            return false;
+          }
+
+          try
+          {
+            fs_ = make_unique<FileStreamerTradeCols>(files_[file_idx_]);
+          }
+          catch (const exception& e)
+          {
+            cerr << "WARN: open failed: " << files_[file_idx_] << " : " << e.what() << "\n";
+            ++file_idx_;
+            continue;
+          }
+        }
+
+        bool ok = false;
+
+        try
+        {
+          ok = fs_->next_rg(
+              start_ns_, end_ns_, sel_,
+              ts_, px_, qty_, tid_, boid_, soid_, ttime_, isMkt_, evt_);
+        }
+        catch (const exception& e)
+        {
+          cerr << "WARN: read failed: " << files_[file_idx_] << " : " << e.what() << "\n";
+          ok = false;
+        }
+
+        if (!ok)
+        {
+          fs_.reset();
+          ++file_idx_;
+          continue;
+        }
+
+        if (ts_.empty())
+        {
+          continue;
+        }
+
+        out.ts            = sel_.ts            ? ts_.data()     : nullptr;
+        out.px            = sel_.px            ? px_.data()     : nullptr;
+        out.qty           = sel_.qty           ? qty_.data()    : nullptr;
+        out.tradeId       = sel_.tradeId       ? tid_.data()    : nullptr;
+        out.buyerOrderId  = sel_.buyerOrderId  ? boid_.data()   : nullptr;
+        out.sellerOrderId = sel_.sellerOrderId ? soid_.data()   : nullptr;
+        out.tradeTime     = sel_.tradeTime     ? ttime_.data()  : nullptr;
+        out.isMarket      = sel_.isMarket      ? isMkt_.data()  : nullptr;
+        out.eventTime     = sel_.eventTime     ? evt_.data()    : nullptr;
+        out.n             = ts_.size();
+        return true;
+      }
+    }
+
+  private:
+    vector<string> files_;
+    size_t file_idx_ = 0;
+    unique_ptr<FileStreamerTradeCols> fs_;
+    int64_t start_ns_;
+    int64_t end_ns_;
+    TradeSelect sel_;
+
+    vector<int64_t> ts_;
+    vector<int64_t> px_;
+    vector<int64_t> qty_;
+    vector<int64_t> tid_;
+    vector<int64_t> boid_;
+    vector<int64_t> soid_;
+    vector<int64_t> ttime_;
+    vector<uint8_t> isMkt_;
+    vector<int64_t> evt_;
+  };
+
   struct DeltaBatchReader
   {
     DeltaBatchReader(vector<string> files, int64_t s, int64_t e, DeltaSelect sel)
-    :
+  :
       files_(move(files)),
       start_ns_(s),
       end_ns_(e),
@@ -1002,6 +1318,13 @@ public:
   {
     auto files = candidate_files(root_, symb, "top", start_ns, end_ns);
     return make_unique<TopBatchReader>(move(files), start_ns, end_ns, sel);
+  }
+
+  unique_ptr<TradeBatchReader> get_trade_cols(
+      int64_t start_ns, int64_t end_ns, const string& symb, TradeSelect sel = {}) const
+  {
+    auto files = candidate_files(root_, symb, "trade", start_ns, end_ns);
+    return make_unique<TradeBatchReader>(move(files), start_ns, end_ns, sel);
   }
 
   unique_ptr<DeltaBatchReader> get_delta_cols(
@@ -1112,16 +1435,47 @@ static DeltaSelect make_delta_select_from_csv(const string& csv)
   return sel;
 }
 
+static TradeSelect make_trade_select_from_csv(const string& csv)
+{
+  TradeSelect sel{};
+  sel.ts = false;
+  sel.px = false;
+  sel.qty = false;
+  sel.tradeId = false;
+  sel.buyerOrderId = false;
+  sel.sellerOrderId = false;
+  sel.tradeTime = false;
+  sel.isMarket = false;
+  sel.eventTime = false;
+
+  for (string t : split_csv(csv))
+  {
+    string k = norm_token(t);
+    if (k == "ts" || k == "time") { sel.ts = true; }
+    else if (k == "px" || k == "price") { sel.px = true; }
+    else if (k == "qty" || k == "size" || k == "quantity") { sel.qty = true; }
+    else if (k == "tradeid" || k == "tid") { sel.tradeId = true; }
+    else if (k == "buyerorderid" || k == "boid") { sel.buyerOrderId = true; }
+    else if (k == "sellerorderid" || k == "soid") { sel.sellerOrderId = true; }
+    else if (k == "tradetime" || k == "ttime") { sel.tradeTime = true; }
+    else if (k == "ismarket" || k == "market") { sel.isMarket = true; }
+    else if (k == "eventtime" || k == "evt" || k == "event") { sel.eventTime = true; }
+  }
+  return sel;
+}
+
 // ======== Example CLI (prints every 1,000,000th row) ========
 // Usage: ./a.out ROOT SYMB TYPE START_NS END_NS [columns_csv]
 //   Examples:
-//     top ts+askPx: ./a.out ROOT SYMB top   START_NS END_NS ts,askPx
-//     delta ask px: ./a.out ROOT SYMB delta START_NS END_NS ts,firstId,lastId,eventTime,askPx
+//     top   ts+askPx: ./a.out ROOT SYMB top   START_NS END_NS ts,askPx
+//     delta ask px : ./a.out ROOT SYMB delta START_NS END_NS ts,firstId,lastId,eventTime,askPx
+//     trade px,qty : ./a.out ROOT SYMB trade START_NS END_NS ts,px,qty,tradeId,isMarket
 int main(int argc, char** argv)
 {
   if (argc < 6)
   {
-    cerr << "Usage: " << argv[0] << " <root> <symb> <type: top|delta> <start_ns> <end_ns> [columns_csv]\n";
+    cerr << "Usage: " << argv[0]
+         << " <root> <symb> <type: top|delta|trade> <start_ns> <end_ns> [columns_csv]\n";
     return 1;
   }
 
@@ -1193,6 +1547,64 @@ int main(int argc, char** argv)
           cout << v.valu[i];
           first = false;
         }
+
+        cout << '\n';
+      }
+    }
+  }
+  else if (type == "trade")
+  {
+    TradeSelect sel{};
+    if (argc >= 7)
+    {
+      sel = make_trade_select_from_csv(argv[6]);
+    }
+
+    auto rdr = db.get_trade_cols(start_ns, end_ns, symb, sel);
+
+    TradeColsView v{};
+    uint64_t seen = 0;
+    while (rdr->next(v))
+    {
+      for (size_t i = 0; i < v.n; ++i)
+      {
+        ++seen;
+        if (seen % 1000000 != 0)
+        {
+          continue;
+        }
+
+        bool first = true;
+        auto put_i64 = [&](const int64_t* p)
+        {
+          if (!p)
+          {
+            return;
+          }
+          if (!first) { cout << ';'; }
+          cout << p[i];
+          first = false;
+        };
+        auto put_u8 = [&](const uint8_t* p)
+        {
+          if (!p)
+          {
+            return;
+          }
+          if (!first) { cout << ';'; }
+          cout << int(p[i]);
+          first = false;
+        };
+
+        put_i64(v.ts);
+        put_i64(v.px);
+        put_i64(v.qty);
+        put_i64(v.tradeId);
+        put_i64(v.buyerOrderId);
+        put_i64(v.sellerOrderId);
+        put_i64(v.tradeTime);
+        put_u8(v.isMarket);
+        put_i64(v.eventTime);
 
         cout << '\n';
       }
